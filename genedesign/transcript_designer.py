@@ -1,314 +1,353 @@
-import csv
-from collections import defaultdict
-from itertools import product
-
-from genedesign.checkers.codon_checker import CodonChecker
-from genedesign.checkers.forbidden_sequence_checker import ForbiddenSequenceChecker
-from genedesign.checkers.internal_promoter_checker import PromoterChecker
+import itertools
+import re
+from collections import Counter
 from genedesign.models.transcript import Transcript
 from genedesign.rbs_chooser import RBSChooser
-
+from genedesign.checkers.forbidden_sequence_checker import ForbiddenSequenceChecker
+from genedesign.checkers.internal_promoter_checker import PromoterChecker
+from genedesign.seq_utils.hairpin_counter import hairpin_counter
+from genedesign.seq_utils.reverse_complement import reverse_complement
+from genedesign.checkers.codon_checker import CodonChecker
+from genedesign.checkers.hairpin_checker import hairpin_checker
 
 class TranscriptDesigner:
     """
-    Reverse translates a protein sequence into a CDS using a 9 + 9 + 18 sliding window:
-    - 9 bp locked preamble
-    - 9 bp current decision zone
-    - 18 bp look-ahead viability search
+    Constructs a DNA CDS from a protein sequence using a sliding window algorithm.
+    Features robust lookahead evaluation and targeted regional error correction 
+    to resolve structural and functional constraints.
     """
 
-    PREAMBLE_CODONS = 3 #9 NT window
-    CURRENT_CODONS = 3 #9 NT window
-    LOOKAHEAD_CODONS = 6 #18 NT window
-    SIGMA70_WINDOW_CODONS = 12 #36 NT window
-    PROMOTER_WINDOW_BP = 29
-    PROMOTER_CONTEXT_CODONS = 9
-    STOP_CODON = "TAA"
+    # Standard genetic code mapping
+    AMINO_ACID_MAP = {
+        'A': ['GCG', 'GCC', 'GCA', 'GCT'], 'C': ['TGC', 'TGT'], 'D': ['GAT', 'GAC'],
+        'E': ['GAA', 'GAG'], 'F': ['TTC', 'TTT'], 'G': ['GGT', 'GGC', 'GGA', 'GGG'],
+        'H': ['CAC', 'CAT'], 'I': ['ATC', 'ATT', 'ATA'], 'K': ['AAA', 'AAG'],
+        'L': ['CTG', 'TTA', 'TTG', 'CTT', 'CTC', 'CTA'], 'M': ['ATG'], 'N': ['AAC', 'AAT'],
+        'P': ['CCG', 'CCT', 'CCC', 'CCA'], 'Q': ['CAG', 'CAA'], 
+        'R': ['CGT', 'CGC', 'CGA', 'CGG', 'AGA', 'AGG'], 'S': ['TCT', 'TCC', 'TCA', 'TCG', 'AGT', 'AGC'],
+        'T': ['ACC', 'ACT', 'ACA', 'ACG'], 'V': ['GTT', 'GTC', 'GTA', 'GTG'], 
+        'W': ['TGG'], 'Y': ['TAC', 'TAT'], 'STOP': ['TAA', 'TAG', 'TGA']
+    }
 
     def __init__(self):
-        self.amino_acid_to_codons = {}
-        self.codon_checker = CodonChecker()
-        self.forbidden_checker = ForbiddenSequenceChecker()
-        self.promoter_checker = PromoterChecker()
-        self.rbsChooser = None
-        self._design_cache = {}
-        self._lookahead_cache = {}
-        self._promoter_check_cache = {}
+        # Tools
+        self.rbs_selector = None
+        self.banned_seq_scanner = None
+        self.promoter_scanner = None
+        self.usage_analyzer = None
+        
+        # Data dictionaries
+        self.synonymous_codons = {}
+        self.cai_scores = {}
+        self.primary_codon = {}
+        self.restricted_motifs = [] 
 
     def initiate(self) -> None:
-        """
-        Initializes the codon table, checkers, and the RBS chooser.
-        """
-        self.rbsChooser = RBSChooser()
-        self.rbsChooser.initiate()
+        """Initializes external checkers and precomputes codon statistics."""
+        self.rbs_selector = RBSChooser()
+        self.rbs_selector.initiate()
 
-        self.codon_checker.initiate()
-        self.forbidden_checker.initiate()
-        self.promoter_checker.initiate()
+        self.banned_seq_scanner = ForbiddenSequenceChecker()
+        self.banned_seq_scanner.initiate()
 
-        self.amino_acid_to_codons = self._load_synonymous_codons()
+        self.promoter_scanner = PromoterChecker()
+        self.promoter_scanner.initiate()
 
-    def run(self, peptide: str, ignores: set) -> Transcript:
-        """
-        Designs a CDS for the peptide using the 9 + 9 + 18 local search.
-        """
-        if self.rbsChooser is None:
-            raise RuntimeError("TranscriptDesigner must be initiated before run().")
+        self.usage_analyzer = CodonChecker()
+        self.usage_analyzer.initiate()
 
-        self._design_cache = {}
-        self._lookahead_cache = {}
-        self._promoter_check_cache = {}
+        # Build comprehensive list of restricted sequences including reverse complements
+        motif_set = set(self.banned_seq_scanner.forbidden)
+        for motif in self.banned_seq_scanner.forbidden:
+            motif_set.add(reverse_complement(motif))
+        self.restricted_motifs = list(motif_set)
 
-        designed_codons = self._design_from(peptide, 0, tuple(), frozenset())
-        if designed_codons is None:
-            raise ValueError("Unable to design a CDS that satisfies the sliding-window constraints.")
+        # Precompute optimal CAI mappings
+        for aa, codon_list in self.AMINO_ACID_MAP.items():
+            max_usage = max([self.usage_analyzer.codon_frequencies.get(c, 0.001) for c in codon_list])
+            approved_codons = []
+            
+            for c in codon_list:
+                usage = self.usage_analyzer.codon_frequencies.get(c, 0.001)
+                calculated_cai = usage / max_usage
+                self.cai_scores[c] = calculated_cai
+                
+                if c not in self.usage_analyzer.rare_codons:
+                    approved_codons.append((c, calculated_cai))
+            
+            approved_codons.sort(key=lambda item: item[1], reverse=True)
+            self.synonymous_codons[aa] = [c[0] for c in approved_codons]
+            
+            if not self.synonymous_codons[aa]:
+                self.synonymous_codons[aa].append(codon_list[0])
+                
+            self.primary_codon[aa] = self.synonymous_codons[aa][0]
 
-        codons = designed_codons + [self.STOP_CODON]
-        cds = ''.join(codons)
-        selected_rbs = self._select_rbs(cds, ignores)
-        return Transcript(selected_rbs, peptide, codons)
+    def run(self, protein_seq: str, rbs_exclusions: set) -> Transcript:
+        """Main orchestrator for generating the optimized transcript."""
+        # Ensure proper termination by treating the sequence as a list of tokens
+        clean_protein = protein_seq.strip().replace('\n', '')
+        if clean_protein.endswith('*'):
+            clean_protein = clean_protein[:-1]
+        elif clean_protein.endswith('STOP'):
+            clean_protein = clean_protein[:-4]
+            
+        protein_tokens = list(clean_protein)
+        protein_tokens.append('STOP')
+        
+        rbs_exclusions = rbs_exclusions or set()
+        chosen_rbs = self.rbs_selector.run("ATG", rbs_exclusions) 
+        full_5_prime_utr = chosen_rbs.utr.upper()
 
-    def _select_rbs(self, cds: str, ignores: set):
-        candidate_ignores = set(ignores)
-        fallback_rbs = None
+        constructed_cds = []
+        global_codon_counts = Counter()
 
-        while True:
-            try:
-                candidate_rbs = self.rbsChooser.run(cds, candidate_ignores)
-            except Exception:
-                if fallback_rbs is not None:
-                    return fallback_rbs
-                raise
+        cache_promoter = {}
+        cache_hairpin = {}
 
-            if fallback_rbs is None:
-                fallback_rbs = candidate_rbs
+        # Process tokens in chunks of 3
+        for i in range(0, len(protein_tokens), 3):
+            active_aa_chunk = protein_tokens[i : i + 3]
+            lookahead_aa_chunk = protein_tokens[i + 3 : i + 20] 
 
-            transcript_dna = candidate_rbs.utr.upper() + cds
-            forbidden_safe, _ = self.forbidden_checker.run(transcript_dna)
-            if self._is_promoter_safe(transcript_dna) and forbidden_safe:
-                return candidate_rbs
+            options_per_aa = [self.synonymous_codons.get(token, [self.primary_codon.get(token, "NNN")]) for token in active_aa_chunk]
+            search_space = list(itertools.product(*options_per_aa))
 
-            candidate_ignores.add(candidate_rbs)
+            # Establish local context for boundaries
+            context_upstream = (full_5_prime_utr + "".join(constructed_cds))[-50:] 
+            context_downstream = "".join([self.primary_codon.get(token, "NNN") for token in lookahead_aa_chunk])
+            
+            # Baseline metrics
+            baseline_banned = sum(context_upstream.count(m) for m in self.restricted_motifs)
 
-    def _load_synonymous_codons(self) -> dict[str, list[str]]:
-        amino_acid_to_codons = defaultdict(list)
-        codon_usage_file = "genedesign/data/codon_usage.txt"
+            if context_upstream not in cache_hairpin:
+                cache_hairpin[context_upstream] = hairpin_counter(context_upstream, 3, 4, 9)[0]
+            baseline_hp_up = cache_hairpin[context_upstream]
 
-        with open(codon_usage_file, "r") as handle:
-            reader = csv.reader(handle, delimiter="\t")
-            for row in reader:
-                if len(row) < 3:
-                    continue
-                codon = row[0].strip().upper()
-                amino_acid = row[1].strip()
-                if amino_acid == "*":
-                    continue
-                usage = float(row[2].strip())
-                amino_acid_to_codons[amino_acid].append((codon, usage))
+            if context_downstream not in cache_hairpin:
+                cache_hairpin[context_downstream] = hairpin_counter(context_downstream, 3, 4, 9)[0]
+            baseline_hp_down = cache_hairpin[context_downstream]
 
-        ranked_codons = {}
-        for amino_acid, codons in amino_acid_to_codons.items():
-            ranked_codons[amino_acid] = [
-                codon for codon, _ in sorted(codons, key=lambda item: item[1], reverse=True)
-            ]
-        return ranked_codons
+            optimal_weight = -float('inf')
+            optimal_selection = search_space[0]
 
-    def _design_from(
-        self,
-        peptide: str,
-        position: int,
-        locked_codons: tuple[str, ...],
-        used_codons: frozenset[str],
-    ) -> list[str] | None:
-        if position >= len(peptide):
-            return []
+            # Evaluate search space
+            for candidate_codons in search_space:
+                fitness = self._calculate_chunk_fitness(
+                    candidate_codons, context_upstream, context_downstream, 
+                    baseline_banned, baseline_hp_up, baseline_hp_down,
+                    cache_promoter, cache_hairpin, global_codon_counts
+                )
 
-        key = (position, locked_codons[-self.PROMOTER_CONTEXT_CODONS :], used_codons)
-        if key in self._design_cache:
-            cached = self._design_cache[key]
-            return list(cached) if cached is not None else None
+                if fitness > optimal_weight:
+                    optimal_weight = fitness
+                    optimal_selection = candidate_codons
 
-        current_aas = peptide[position : position + self.CURRENT_CODONS]
-        preamble = list(locked_codons[-self.PREAMBLE_CODONS :])
-        promoter_context = tuple(locked_codons[-self.PROMOTER_CONTEXT_CODONS :])
+            constructed_cds.extend(optimal_selection)
+            for c in optimal_selection: 
+                global_codon_counts[c] += 1
 
-        for current_codons in self._enumerate_chunk_codons(current_aas, used_codons):
-            if not self._passes_current_suite(preamble, current_codons):
+        # Final targeted cleanup
+        constructed_cds = self._iterative_error_correction(constructed_cds, protein_tokens, chosen_rbs)
+
+        # Return the clean protein string without the artificial token at the end
+        return Transcript(chosen_rbs, clean_protein, constructed_cds)
+
+    def _calculate_chunk_fitness(
+        self, candidate_codons, context_upstream, context_downstream, 
+        baseline_banned, baseline_hp_up, baseline_hp_down, 
+        cache_promoter, cache_hairpin, global_codon_counts
+    ) -> float:
+        """Evaluates a sliding window candidate against all biological constraints."""
+        window_seq = "".join(candidate_codons)
+        eval_region = context_upstream + window_seq + context_downstream
+        eval_region_upper = eval_region.upper()
+        fitness_score = 0
+        
+        # Penalty 1: Restricted Motifs
+        current_banned = sum(eval_region_upper.count(m) for m in self.restricted_motifs)
+        added_banned = current_banned - baseline_banned
+        if added_banned > 0:
+            fitness_score -= added_banned * 10000000
+
+        # Penalty 2: Internal Promoters
+        promoter_eval_string = context_upstream[-28:] + window_seq + context_downstream[:28]
+        if promoter_eval_string not in cache_promoter:
+            found_promoter = not self.promoter_scanner.run(promoter_eval_string)[0]
+            cache_promoter[promoter_eval_string] = 1 if found_promoter else 0
+            
+        if cache_promoter[promoter_eval_string] > 0:
+            fitness_score -= 500000
+
+        # Penalty 3: Secondary Structure (Hairpins)
+        if eval_region_upper not in cache_hairpin:
+            cache_hairpin[eval_region_upper] = hairpin_counter(eval_region_upper, 3, 4, 9)[0]
+        total_hairpins = cache_hairpin[eval_region_upper]
+        
+        added_hairpins = total_hairpins - baseline_hp_up - baseline_hp_down
+        if added_hairpins > 0:
+            fitness_score -= added_hairpins * 500000
+            
+        local_junction = (context_upstream + window_seq)[-50:]
+        if local_junction not in cache_hairpin:
+            cache_hairpin[local_junction] = hairpin_counter(local_junction, 3, 4, 9)[0]
+        junction_hairpins = cache_hairpin[local_junction]
+        
+        if junction_hairpins > 1:
+            fitness_score -= 2000000
+        elif junction_hairpins == 1:
+            fitness_score -= 20000
+
+        # Reward: CAI & Diversity Mapping
+        cumulative_cai = sum(self.cai_scores.get(c, 0.01) for c in candidate_codons)
+        diversity_tax = sum((global_codon_counts[c] ** 3) for c in candidate_codons) 
+        fitness_score += (cumulative_cai * 10) - (diversity_tax * 5)
+
+        return fitness_score
+
+    def _iterative_error_correction(self, current_cds, protein_tokens, rbs):
+        """Scans the completed sequence and surgically patches specific violations."""
+        max_iterations = 12 
+        for _ in range(max_iterations):
+            full_transcript = rbs.utr.upper() + "".join(current_cds)
+            is_clean = True
+
+            has_banned, banned_fragment = self.banned_seq_scanner.run(full_transcript)
+            if has_banned and banned_fragment:
+                current_cds = self._patch_local_region(banned_fragment, current_cds, protein_tokens, rbs, "forbidden")
+                is_clean = False
                 continue
 
-            lookahead_start = position + len(current_aas)
-            lookahead_aas = peptide[lookahead_start : lookahead_start + self.LOOKAHEAD_CODONS]
-            if not self._passes_lookahead_suite(promoter_context, current_codons, lookahead_aas):
+            passed_promoter, promoter_fragment = self.promoter_scanner.run(full_transcript)
+            if not passed_promoter and promoter_fragment:
+                current_cds = self._patch_local_region(promoter_fragment, current_cds, protein_tokens, rbs, "promoter")
+                is_clean = False
                 continue
 
-            next_locked_codons = locked_codons + tuple(current_codons)
-            next_used_codons = used_codons | frozenset(current_codons)
-            suffix = self._design_from(peptide, lookahead_start, next_locked_codons, next_used_codons)
-            if suffix is not None:
-                solution = tuple(current_codons + suffix)
-                self._design_cache[key] = solution
-                return list(solution)
-
-        self._design_cache[key] = None
-        return None
-
-    def _enumerate_chunk_codons(self, amino_acids: str, used_codons: frozenset[str]) -> list[list[str]]:
-        if not amino_acids:
-            return [[]]
-
-        options = [self.amino_acid_to_codons[aa] for aa in amino_acids]
-        ranked_chunks = []
-        for candidate in product(*options):
-            candidate_set = set(candidate)
-            new_unique_codons = len(candidate_set - used_codons)
-            intra_chunk_diversity = len(candidate_set)
-            frequency_score = sum(self.codon_checker.codon_frequencies.get(codon, 0.0) for codon in candidate)
-            ranked_chunks.append(((new_unique_codons, intra_chunk_diversity, frequency_score), list(candidate)))
-        ranked_chunks.sort(key=lambda item: item[0], reverse=True)
-        return [candidate for _, candidate in ranked_chunks]
-
-    def _passes_current_suite(self, preamble: list[str], current_codons: list[str]) -> bool:
-        combined_codons = preamble + current_codons
-        combined_dna = ''.join(combined_codons)
-
-        sequence_allowed, _ = self.forbidden_checker.run(combined_dna)
-        if not sequence_allowed:
-            return False
-
-        return all(codon not in self.codon_checker.rare_codons for codon in current_codons)
-
-    def _passes_lookahead_suite(
-        self,
-        promoter_context: tuple[str, ...],
-        current_codons: list[str],
-        lookahead_aas: str,
-    ) -> bool:
-        fixed_prefix = promoter_context + tuple(current_codons)
-
-        if not lookahead_aas:
-            return self._passes_terminal_stop_suite(fixed_prefix)
-
-        cache_key = (''.join(fixed_prefix), lookahead_aas)
-        if cache_key not in self._lookahead_cache:
-            self._lookahead_cache[cache_key] = self._search_lookahead_path(fixed_prefix, lookahead_aas, tuple())
-        return self._lookahead_cache[cache_key]
-
-    def _search_lookahead_path(
-        self,
-        fixed_prefix: tuple[str, ...],
-        lookahead_aas: str,
-        candidate_codons: tuple[str, ...],
-    ) -> bool:
-        if len(candidate_codons) == len(lookahead_aas):
-            return self._evaluate_full_lookahead(fixed_prefix, candidate_codons)
-
-        amino_acid = lookahead_aas[len(candidate_codons)]
-        for codon in self.amino_acid_to_codons[amino_acid]:
-            if codon in self.codon_checker.rare_codons:
+            passed_hp, hp_fragment = hairpin_checker(full_transcript)
+            if not passed_hp and hp_fragment:
+                current_cds = self._patch_local_region(hp_fragment, current_cds, protein_tokens, rbs, "hairpin")
+                is_clean = False
                 continue
 
-            next_candidate = candidate_codons + (codon,)
-            if not self._passes_partial_window_checks(fixed_prefix, next_candidate):
-                continue
-            if self._search_lookahead_path(fixed_prefix, lookahead_aas, next_candidate):
-                return True
+            if is_clean:
+                break
+                
+        return current_cds
 
-        return False
+    def _patch_local_region(self, violation_data, current_cds, protein_tokens, rbs, category):
+        """Identifies the coordinates of a violation and reroutes the sequence locally."""
+        if category == "hairpin":
+            match_data = re.search(r'([ACGTacgt]+)\(([ACGTacgt]+)\)([ACGTacgt]+)', violation_data)
+            if match_data:
+                pure_violation_str = (match_data.group(1) + match_data.group(2) + match_data.group(3)).upper()
+            else:
+                pure_violation_str = re.sub(r'[^ACGTacgt]', '', violation_data).upper()
+        else:
+            pure_violation_str = re.sub(r'[^ACGTacgt]', '', violation_data).upper()
+            
+        full_search_space = rbs.utr.upper() + "".join(current_cds)
+        anchor_idx = full_search_space.find(pure_violation_str)
+        if anchor_idx == -1: 
+            anchor_idx = full_search_space.find(reverse_complement(pure_violation_str))
+        if anchor_idx == -1: 
+            return current_cds 
+            
+        utr_offset = len(rbs.utr)
+        
+        # Configure search radius based on violation type
+        if category == "promoter":
+            target_nucleotide = anchor_idx - utr_offset + 22 
+            radius = 2 
+        elif category == "hairpin":
+            target_nucleotide = anchor_idx - utr_offset + (len(pure_violation_str) // 2)
+            radius = 5 
+        else:
+            target_nucleotide = anchor_idx - utr_offset + (len(pure_violation_str) // 2)
+            radius = 2
 
-    def _passes_partial_window_checks(
-        self,
-        fixed_prefix: tuple[str, ...],
-        candidate_codons: tuple[str, ...],
-    ) -> bool:
-        combined_dna = ''.join(fixed_prefix + candidate_codons)
-
-        sequence_allowed, _ = self.forbidden_checker.run(combined_dna)
-        if not sequence_allowed:
-            return False
-
-        return True
-
-    def _evaluate_full_lookahead(
-        self,
-        fixed_prefix: tuple[str, ...],
-        lookahead_codons: tuple[str, ...],
-    ) -> bool:
-        combined_dna = ''.join(fixed_prefix + lookahead_codons)
-        sequence_allowed, _ = self.forbidden_checker.run(combined_dna)
-        if not sequence_allowed:
-            return False
-
-        return (
-            self._passes_sigma70_suite(fixed_prefix, lookahead_codons)
-            and
-            all(codon not in self.codon_checker.rare_codons for codon in lookahead_codons)
-            and self._passes_lookahead_codon_usage(list(lookahead_codons))
+        center_codon = max(0, target_nucleotide // 3)
+        idx_start = max(0, center_codon - radius)
+        idx_end = min(len(current_cds), center_codon + radius + 1)
+        
+        # target_aas handles the token list smoothly regardless of character length
+        target_aas = protein_tokens[idx_start:idx_end]
+        
+        # Contextual Boundary Resolution
+        compiled_upstream = "".join(current_cds[:idx_start])
+        physical_upstream = (rbs.utr.upper() + compiled_upstream)[-50:]
+        physical_downstream = "".join(current_cds[idx_end : idx_end + 16])
+        
+        # Attempt 1: Standard restricted search (High CAI bias)
+        standard_options = [self.synonymous_codons.get(token, [self.primary_codon.get(token, "NNN")])[:2] for token in target_aas]
+        standard_combos = list(itertools.product(*standard_options))
+        top_fitness, best_solution = self._evaluate_repair_candidates(
+            standard_combos, physical_upstream, physical_downstream, pure_violation_str
         )
+        
+        # Attempt 2: Expanded Search Space
+        if top_fitness < -1000000:
+            expanded_options = []
+            for i, token in enumerate(target_aas):
+                # Provide max flexibility at the violation epicenter
+                if len(target_aas)//2 - 2 <= i <= len(target_aas)//2 + 2:
+                    expanded_options.append(self.synonymous_codons.get(token, [self.primary_codon.get(token, "NNN")])[:4])
+                else:
+                    expanded_options.append(self.synonymous_codons.get(token, [self.primary_codon.get(token, "NNN")])[:1])
+            
+            expanded_combos = list(itertools.product(*expanded_options))
+            fallback_fitness, fallback_solution = self._evaluate_repair_candidates(
+                expanded_combos, physical_upstream, physical_downstream, pure_violation_str
+            )
+            
+            if fallback_fitness > top_fitness:
+                best_solution = fallback_solution
+                
+        current_cds[idx_start:idx_end] = list(best_solution)
+        return current_cds
 
-    def _passes_lookahead_codon_usage(self, lookahead_codons: list[str]) -> bool:
-        if not lookahead_codons:
-            return True
-
-        _, _, rare_codon_count, _ = self.codon_checker.run(lookahead_codons)
-        return rare_codon_count == 0
-
-    def _passes_terminal_stop_suite(self, codons: tuple[str, ...]) -> bool:
-        terminal_dna = ''.join(codons) + self.STOP_CODON
-        sequence_allowed, _ = self.forbidden_checker.run(terminal_dna)
-        if not sequence_allowed:
-            return False
-
-        return self._passes_promoter_check(codons + (self.STOP_CODON,))
-
-    def _passes_sigma70_suite(
-        self,
-        fixed_prefix: tuple[str, ...],
-        lookahead_codons: tuple[str, ...],
-    ) -> bool:
-        sigma70_dna = ''.join(fixed_prefix + lookahead_codons)
-        current_start = max(0, len(fixed_prefix) - self.CURRENT_CODONS) * 3
-        current_end = current_start + (self.CURRENT_CODONS * 3)
-
-        if len(sigma70_dna) < self.PROMOTER_WINDOW_BP:
-            return True
-
-        if len(sigma70_dna) <= self.SIGMA70_WINDOW_CODONS * 3:
-            return self._is_promoter_safe(sigma70_dna)
-
-        max_window_start = len(sigma70_dna) - (self.SIGMA70_WINDOW_CODONS * 3)
-        for start in range(max_window_start + 1):
-            end = start + (self.SIGMA70_WINDOW_CODONS * 3)
-            overlaps_current = start < current_end and end > current_start
-            if not overlaps_current:
-                continue
-
-            if not self._is_promoter_safe(sigma70_dna[start:end]):
-                return False
-
-        return True
-
-    def _is_promoter_safe(self, dna: str) -> bool:
-        if len(dna) < self.PROMOTER_WINDOW_BP:
-            return True
-
-        cached = self._promoter_check_cache.get(dna)
-        if cached is not None:
-            return cached
-
-        promoter_safe, _ = self.promoter_checker.run(dna)
-        self._promoter_check_cache[dna] = promoter_safe
-        return promoter_safe
-
-    def _passes_promoter_check(self, codons: tuple[str, ...]) -> bool:
-        dna = ''.join(codons)
-        return self._is_promoter_safe(dna)
-
+    def _evaluate_repair_candidates(self, permutations, physical_upstream, physical_downstream, pure_violation_str):
+        """Scores potential patch sequences for the targeted region."""
+        highest_score = -float('inf')
+        winning_sequence = permutations[0] if permutations else []
+        
+        for candidate in permutations:
+            simulated_span = physical_upstream + "".join(candidate) + physical_downstream
+            simulated_span_upper = simulated_span.upper()
+            temp_score = 0
+            
+            if pure_violation_str in simulated_span_upper or reverse_complement(pure_violation_str) in simulated_span_upper:
+                temp_score -= 10000000
+            
+            banned_hits = sum(simulated_span_upper.count(m) for m in self.restricted_motifs)
+            temp_score -= banned_hits * 100000
+            
+            promoter_hits = 1 if not self.promoter_scanner.run(simulated_span)[0] else 0
+            temp_score -= promoter_hits * 50000
+            
+            passed_hp, _ = hairpin_checker(simulated_span_upper)
+            if not passed_hp:
+                temp_score -= 2000000
+            else:
+                hp_count, _ = hairpin_counter(simulated_span, 3, 4, 9)
+                temp_score -= hp_count * 20000
+            
+            cai_bonus = sum(self.cai_scores.get(c, 0.01) for c in candidate)
+            temp_score += cai_bonus * 10
+            
+            if temp_score > highest_score:
+                highest_score = temp_score
+                winning_sequence = candidate
+                
+        return highest_score, winning_sequence
+               
 if __name__ == "__main__":
-    # Example usage of TranscriptDesigner
-    peptide = "MYPFIRTARMTV"
-
+    test_peptide = "MYPFIRTARMTV"
+    
     designer = TranscriptDesigner()
     designer.initiate()
 
-    transcript = designer.run(peptide, set())
-    print(transcript)
+    exclusions = set()
+    final_transcript = designer.run(test_peptide, exclusions)
+    
+    print(final_transcript)
