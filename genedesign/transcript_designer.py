@@ -9,6 +9,7 @@ from genedesign.seq_utils.hairpin_counter import hairpin_counter
 from genedesign.seq_utils.reverse_complement import reverse_complement
 from genedesign.checkers.codon_checker import CodonChecker
 from genedesign.checkers.hairpin_checker import hairpin_checker
+from genedesign.checkers.internal_rbs_checker import InternalRBSChecker  # ADDED
 
 class TranscriptDesigner:
     """
@@ -35,6 +36,7 @@ class TranscriptDesigner:
         self.banned_seq_scanner = None
         self.promoter_scanner = None
         self.usage_analyzer = None
+        self.rbs_scanner = None  # ADDED
         
         # Data dictionaries
         self.synonymous_codons = {}
@@ -55,6 +57,9 @@ class TranscriptDesigner:
 
         self.usage_analyzer = CodonChecker()
         self.usage_analyzer.initiate()
+        
+        self.rbs_scanner = InternalRBSChecker()  # ADDED
+        self.rbs_scanner.initiate()              # ADDED
 
         # Build comprehensive list of restricted sequences including reverse complements
         motif_set = set(self.banned_seq_scanner.forbidden)
@@ -114,7 +119,8 @@ class TranscriptDesigner:
             search_space = list(itertools.product(*options_per_aa))
 
             # Establish local context for boundaries
-            context_upstream = (full_5_prime_utr + "".join(constructed_cds))[-50:] 
+            cds_upstream_chunk = "".join(constructed_cds)[-50:]
+            context_upstream = (full_5_prime_utr + cds_upstream_chunk)[-50:] 
             context_downstream = "".join([self.primary_codon.get(token, "NNN") for token in lookahead_aa_chunk])
             
             # Baseline metrics
@@ -127,6 +133,10 @@ class TranscriptDesigner:
             if context_downstream not in cache_hairpin:
                 cache_hairpin[context_downstream] = hairpin_counter(context_downstream, 3, 4, 9)[0]
             baseline_hp_down = cache_hairpin[context_downstream]
+            
+            # ADDED: Baseline metrics for Internal RBS
+            baseline_rbs_up = len(self.rbs_scanner.pattern.findall(cds_upstream_chunk))
+            baseline_rbs_down = len(self.rbs_scanner.pattern.findall(context_downstream))
 
             optimal_weight = -float('inf')
             optimal_selection = search_space[0]
@@ -134,8 +144,8 @@ class TranscriptDesigner:
             # Evaluate search space
             for candidate_codons in search_space:
                 fitness = self._calculate_chunk_fitness(
-                    candidate_codons, context_upstream, context_downstream, 
-                    baseline_banned, baseline_hp_up, baseline_hp_down,
+                    candidate_codons, context_upstream, cds_upstream_chunk, context_downstream, 
+                    baseline_banned, baseline_hp_up, baseline_hp_down, baseline_rbs_up, baseline_rbs_down,
                     cache_promoter, cache_hairpin, global_codon_counts
                 )
 
@@ -154,8 +164,8 @@ class TranscriptDesigner:
         return Transcript(chosen_rbs, clean_protein, constructed_cds)
 
     def _calculate_chunk_fitness(
-        self, candidate_codons, context_upstream, context_downstream, 
-        baseline_banned, baseline_hp_up, baseline_hp_down, 
+        self, candidate_codons, context_upstream, cds_upstream_chunk, context_downstream, 
+        baseline_banned, baseline_hp_up, baseline_hp_down, baseline_rbs_up, baseline_rbs_down,
         cache_promoter, cache_hairpin, global_codon_counts
     ) -> float:
         """Evaluates a sliding window candidate against all biological constraints."""
@@ -198,6 +208,13 @@ class TranscriptDesigner:
         elif junction_hairpins == 1:
             fitness_score -= 20000
 
+        # ADDED: Penalty 4: Internal RBS check (Scanning CDS only)
+        test_cds_local = cds_upstream_chunk + window_seq + context_downstream
+        test_rbs_count = len(self.rbs_scanner.pattern.findall(test_cds_local))
+        added_rbs = test_rbs_count - baseline_rbs_up - baseline_rbs_down
+        if added_rbs > 0:
+            fitness_score -= added_rbs * 5000000
+
         # Reward: CAI & Diversity Mapping
         cumulative_cai = sum(self.cai_scores.get(c, 0.01) for c in candidate_codons)
         diversity_tax = sum((global_codon_counts[c] ** 3) for c in candidate_codons) 
@@ -230,6 +247,14 @@ class TranscriptDesigner:
                 is_clean = False
                 continue
 
+            # ADDED: RBS Sweep strictly scanning the CDS
+            cds_only = "".join(current_cds)
+            passed_rbs, rbs_fragment = self.rbs_scanner.run(cds_only)
+            if not passed_rbs and rbs_fragment:
+                current_cds = self._patch_local_region(rbs_fragment, current_cds, protein_tokens, rbs, "rbs")
+                is_clean = False
+                continue
+
             if is_clean:
                 break
                 
@@ -246,25 +271,35 @@ class TranscriptDesigner:
         else:
             pure_violation_str = re.sub(r'[^ACGTacgt]', '', violation_data).upper()
             
-        full_search_space = rbs.utr.upper() + "".join(current_cds)
-        anchor_idx = full_search_space.find(pure_violation_str)
-        if anchor_idx == -1: 
-            anchor_idx = full_search_space.find(reverse_complement(pure_violation_str))
-        if anchor_idx == -1: 
-            return current_cds 
-            
-        utr_offset = len(rbs.utr)
-        
-        # Configure search radius based on violation type
-        if category == "promoter":
-            target_nucleotide = anchor_idx - utr_offset + 22 
-            radius = 2 
-        elif category == "hairpin":
-            target_nucleotide = anchor_idx - utr_offset + (len(pure_violation_str) // 2)
-            radius = 5 
+        # ADDED: Safe coordinate branching for RBS
+        if category == "rbs":
+            search_seq = "".join(current_cds)
+            anchor_idx = search_seq.find(pure_violation_str)
+            if anchor_idx == -1: 
+                anchor_idx = search_seq.find(reverse_complement(pure_violation_str))
+            if anchor_idx == -1: 
+                return current_cds 
+            target_nucleotide = anchor_idx + 3 
+            radius = 3 
         else:
-            target_nucleotide = anchor_idx - utr_offset + (len(pure_violation_str) // 2)
-            radius = 2
+            search_seq = rbs.utr.upper() + "".join(current_cds)
+            anchor_idx = search_seq.find(pure_violation_str)
+            if anchor_idx == -1: 
+                anchor_idx = search_seq.find(reverse_complement(pure_violation_str))
+            if anchor_idx == -1: 
+                return current_cds 
+            utr_offset = len(rbs.utr)
+            
+            # Configure search radius based on violation type
+            if category == "promoter":
+                target_nucleotide = anchor_idx - utr_offset + 22 
+                radius = 2 
+            elif category == "hairpin":
+                target_nucleotide = anchor_idx - utr_offset + (len(pure_violation_str) // 2)
+                radius = 5 
+            else:
+                target_nucleotide = anchor_idx - utr_offset + (len(pure_violation_str) // 2)
+                radius = 2
 
         center_codon = max(0, target_nucleotide // 3)
         idx_start = max(0, center_codon - radius)
@@ -274,15 +309,16 @@ class TranscriptDesigner:
         target_aas = protein_tokens[idx_start:idx_end]
         
         # Contextual Boundary Resolution
-        compiled_upstream = "".join(current_cds[:idx_start])
-        physical_upstream = (rbs.utr.upper() + compiled_upstream)[-50:]
+        compiled_cds_upstream = "".join(current_cds[:idx_start])
+        cds_upstream_chunk = compiled_cds_upstream[-50:] # Added for RBS boundary checks
+        physical_upstream = (rbs.utr.upper() + compiled_cds_upstream)[-50:]
         physical_downstream = "".join(current_cds[idx_end : idx_end + 16])
         
         # Attempt 1: Standard restricted search (High CAI bias)
         standard_options = [self.synonymous_codons.get(token, [self.primary_codon.get(token, "NNN")])[:2] for token in target_aas]
         standard_combos = list(itertools.product(*standard_options))
         top_fitness, best_solution = self._evaluate_repair_candidates(
-            standard_combos, physical_upstream, physical_downstream, pure_violation_str
+            standard_combos, physical_upstream, cds_upstream_chunk, physical_downstream, pure_violation_str
         )
         
         # Attempt 2: Expanded Search Space
@@ -297,7 +333,7 @@ class TranscriptDesigner:
             
             expanded_combos = list(itertools.product(*expanded_options))
             fallback_fitness, fallback_solution = self._evaluate_repair_candidates(
-                expanded_combos, physical_upstream, physical_downstream, pure_violation_str
+                expanded_combos, physical_upstream, cds_upstream_chunk, physical_downstream, pure_violation_str
             )
             
             if fallback_fitness > top_fitness:
@@ -306,7 +342,7 @@ class TranscriptDesigner:
         current_cds[idx_start:idx_end] = list(best_solution)
         return current_cds
 
-    def _evaluate_repair_candidates(self, permutations, physical_upstream, physical_downstream, pure_violation_str):
+    def _evaluate_repair_candidates(self, permutations, physical_upstream, cds_upstream_chunk, physical_downstream, pure_violation_str):
         """Scores potential patch sequences for the targeted region."""
         highest_score = -float('inf')
         winning_sequence = permutations[0] if permutations else []
@@ -331,6 +367,11 @@ class TranscriptDesigner:
             else:
                 hp_count, _ = hairpin_counter(simulated_span, 3, 4, 9)
                 temp_score -= hp_count * 20000
+                
+            # ADDED: RBS validation inside the patch sequence scoring
+            test_cds_local = cds_upstream_chunk + "".join(candidate) + physical_downstream
+            if not self.rbs_scanner.run(test_cds_local)[0]:
+                temp_score -= 20000000
             
             cai_bonus = sum(self.cai_scores.get(c, 0.01) for c in candidate)
             temp_score += cai_bonus * 10
