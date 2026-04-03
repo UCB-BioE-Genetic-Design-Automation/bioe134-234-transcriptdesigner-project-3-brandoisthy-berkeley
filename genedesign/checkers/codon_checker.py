@@ -60,8 +60,7 @@ class CodonChecker:
 
         # Calculate codon diversity
         codon_counts = Counter(cds)
-        total_codons = len(cds)
-        codon_diversity = len(codon_counts) / total_codons if total_codons > 0 else 0.0
+        codon_diversity = len(codon_counts) / 62
 
         # Count rare codons
         rare_codon_count = sum(codon_counts[codon] for codon in self.rare_codons if codon in cds)
